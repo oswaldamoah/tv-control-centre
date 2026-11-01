@@ -61,7 +61,7 @@ class RemoteShortcutService : AccessibilityService() {
         return false
     }
 
-    private fun thisRunnable(keyCode: Int, press: Press, digit: String) = Runnable {
+    private fun thisRunnable(keyCode: Int, press: Press, digit: String): Runnable = Runnable {
         if (presses[keyCode] === press && !press.fired) {
             val heldFor = SystemClock.uptimeMillis() - press.startedAt
             if (heldFor >= HOLD_THRESHOLD_MS) {
