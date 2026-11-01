@@ -5,6 +5,9 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.media.tv.TvInputInfo
+import android.media.tv.TvInputManager
+import android.provider.Settings
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
@@ -31,6 +34,31 @@ class MainActivity : Activity() {
         slides = prefs.getString("slides", "").orEmpty().split("\n").filter { it.isNotBlank() }.toMutableList()
         dashboard()
         connectCompanion()
+        handleShortcutIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShortcutIntent(intent)
+    }
+
+    private fun handleShortcutIntent(intent: Intent?) {
+        if (intent?.action != ACTION_REMOTE_SHORTCUT) return
+        val digit = intent.getStringExtra(EXTRA_SHORTCUT_DIGIT) ?: return
+        intent.action = null
+        when (digit) {
+            "1" -> selectHdmi(1)
+            "2" -> selectHdmi(2)
+            "3" -> selectHdmi(3)
+            "4" -> selectHdmi(4)
+            "5" -> launchShare()
+            "6" -> openWifiRecovery()
+            "7" -> ambient()
+            "8" -> dashboard()
+            "9" -> nextSlide()
+            "0" -> selectHdmi(3)
+        }
     }
 
     private fun makeScreen(title: String): LinearLayout {
@@ -64,11 +92,20 @@ class MainActivity : Activity() {
             setTextColor(0xFF7DE3A5.toInt()); setPadding(0, 16, 0, 8)
         }
         col.addView(status)
+        col.addView(TextView(this).apply {
+            text = if (shortcutServiceEnabled()) "REMOTE SHORTCUTS: ENABLED · HOLD 1–0 FOR 3 SECONDS" else "REMOTE SHORTCUTS: SETUP REQUIRED · 3-SECOND HOLD"
+            textSize = 13f
+            setTextColor(if (shortcutServiceEnabled()) 0xFF7DE3A5.toInt() else 0xFFFFD27D.toInt())
+            setPadding(0, 4, 0, 12)
+        })
         button(col, "AMBIENT MODE") { ambient() }
         button(col, "WIRELESS SCREEN SHARE") { launchShare() }
+        button(col, "HDMI INPUTS 1–4") { hdmiMenu() }
         button(col, "HDMI 3 — BACKUP") { hdmi3() }
         button(col, "RECOVERY OPTIONS") { recovery() }
         button(col, "CHANGE SLIDESHOW IMAGES") { chooseImages() }
+        button(col, "REMOTE SHORTCUT SETUP") { shortcutSetup() }
+        button(col, "WINDOWS COMPANION SETTINGS") { companionSettings() }
         button(col, "NORMAL HISENSE TV") { finish() }
     }
 
@@ -146,12 +183,75 @@ class MainActivity : Activity() {
         if (i != null) startActivity(i) else toast("Screen Share has no exposed launch activity. Use the original TV app menu.")
     }
 
-    private fun hdmi3() {
-        val inputId = "com.hisense.tv.hitvinput/.hdmi.HdmiTvInputService/HW6"
+    private fun hdmi3() = selectHdmi(3)
+
+    private fun hdmiMenu() {
+        AlertDialog.Builder(this).setTitle("Select HDMI input")
+            .setItems(arrayOf("HDMI 1", "HDMI 2", "HDMI 3 · Backup", "HDMI 4")) { _, which -> selectHdmi(which + 1) }
+            .show()
+    }
+
+    private fun shortcutServiceEnabled(): Boolean {
+        val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES).orEmpty()
+        return enabled.split(':').any { it.equals("$packageName/.RemoteShortcutService", true) || it.equals("$packageName/${RemoteShortcutService::class.java.name}", true) }
+    }
+
+    private fun selectHdmi(number: Int) {
         try {
+            val manager = getSystemService(TV_INPUT_SERVICE) as TvInputManager
+            val candidates = manager.tvInputList.filter { it.type == TvInputInfo.TYPE_HDMI }
+            val match = candidates.firstOrNull { info ->
+                val label = info.loadLabel(this).toString().lowercase()
+                val id = info.id.lowercase()
+                label.contains("hdmi $number") || label.contains("hdmi$number") ||
+                    id.contains("hdmi$number") || id.contains("hdmi_$number") ||
+                    (number == 3 && id == "com.hisense.tv.hitvinput/.hdmi.hdmitvinputservice/hw6")
+            }
+            val inputId = match?.id ?: if (number == 3) {
+                "com.hisense.tv.hitvinput/.hdmi.HdmiTvInputService/HW6"
+            } else null
+            if (inputId == null) {
+                toast("HDMI $number was not identified by this TV firmware. Use INPUT on the remote.")
+                return
+            }
             val uri = android.media.tv.TvContract.buildChannelUriForPassthroughInput(inputId)
             startActivity(Intent(Intent.ACTION_VIEW, uri))
-        } catch (_: Exception) { toast("HDMI 3 selection is not exposed. Use the remote INPUT button.") }
+        } catch (_: Exception) {
+            toast("HDMI $number selection is not exposed by this firmware. Use the remote INPUT button.")
+        }
+    }
+
+    private fun openWifiRecovery() {
+        try { startActivity(Intent(Settings.ACTION_WIFI_SETTINGS)) }
+        catch (_: Exception) { toast("Open Network Settings from the Hisense TV settings menu.") }
+    }
+
+    private fun shortcutSetup() {
+        AlertDialog.Builder(this).setTitle("3-second remote shortcuts")
+            .setMessage("Hold a number key continuously for 3 seconds to run its action. Shorter presses are not used by this app and should continue to the foreground TV app.\n\n1 HDMI 1  •  2 HDMI 2  •  3 HDMI 3  •  4 HDMI 4\n5 Screen Share  •  6 Wi-Fi settings\n7 Ambient Mode  •  8 Dashboard\n9 Next background  •  0 HDMI 3\n\nEnable TV Control Centre under Settings → Accessibility. Some Hisense firmware versions may not deliver global IR key events to third-party accessibility services.")
+            .setPositiveButton("Open Accessibility Settings") { _, _ ->
+                try { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                catch (_: Exception) { toast("Open Accessibility in TV Settings.") }
+            }.setNegativeButton("Close", null).show()
+    }
+
+    private fun companionSettings() {
+        val field = EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+            setText(prefs.getString("pc_ip", "192.168.8.159"))
+            hint = "Windows PC IPv4 address"
+        }
+        AlertDialog.Builder(this).setTitle("Windows companion IP")
+            .setMessage("Enter the Windows PC IPv4 address shown in the companion app.")
+            .setView(field)
+            .setPositiveButton("Save and reconnect") { _, _ ->
+                val host = field.text.toString().trim()
+                if (host.isNotBlank()) {
+                    prefs.edit().putString("pc_ip", host).apply()
+                    socket?.close(1000, "IP changed")
+                    connectCompanion()
+                }
+            }.setNegativeButton("Cancel", null).show()
     }
 
     private fun recovery() {
@@ -176,7 +276,11 @@ class MainActivity : Activity() {
                         "ambient" -> runOnUiThread { ambient() }
                         "dashboard" -> runOnUiThread { dashboard() }
                         "screen_share" -> runOnUiThread { launchShare() }
+                        "hdmi1" -> runOnUiThread { selectHdmi(1) }
+                        "hdmi2" -> runOnUiThread { selectHdmi(2) }
                         "hdmi3" -> runOnUiThread { hdmi3() }
+                        "hdmi4" -> runOnUiThread { selectHdmi(4) }
+                        "wifi_recovery" -> runOnUiThread { openWifiRecovery() }
                         "next_wallpaper" -> runOnUiThread { nextSlide() }
                     }
                 } catch (_: Exception) {}
@@ -192,4 +296,8 @@ class MainActivity : Activity() {
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
     override fun onDestroy() { socket?.close(1000, "closing"); super.onDestroy() }
+    companion object {
+        const val ACTION_REMOTE_SHORTCUT = "com.oswald.tvcontrol.REMOTE_SHORTCUT"
+        const val EXTRA_SHORTCUT_DIGIT = "shortcut_digit"
+    }
 }

@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">TV Control Centre</string>
+    <string name="remote_shortcut_description">Runs TV Control Centre shortcuts when a number key is held for 3 seconds.</string>
+</resources>
