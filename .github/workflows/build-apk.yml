@@ -1,3 +1,4 @@
+
 name: Build TV Control Centre APK
 
 on:
@@ -15,42 +16,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Download the repository source code
       - name: Checkout project
         uses: actions/checkout@v4
 
-      # 2. Install Java 17
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # 3. Install Android SDK
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
-      # 4. Install required Android SDK components
-      - name: Install Android SDK 35
+      - name: Install Android SDK packages
         run: |
-          sdkmanager --install "platforms;android-35"
-          sdkmanager --install "build-tools;35.0.0"
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
 
-      # 5. Accept Android SDK licences
-      - name: Accept Android SDK licences
-        run: yes | sdkmanager --licenses || true
-
-      # 6. Install Gradle 8.9
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
 
-      # 7. Build the debug APK
       - name: Build APK
         run: gradle --no-daemon assembleDebug
 
-      # 8. Upload the generated APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
