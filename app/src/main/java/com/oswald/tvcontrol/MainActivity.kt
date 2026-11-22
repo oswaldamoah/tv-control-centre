@@ -115,7 +115,7 @@ class MainActivity : Activity() {
 
     private fun dashboard() {
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        clearWallpaper()
+        clearWallpaperImage()
         val col = makeScreen("TV CONTROL CENTRE")
         col.addView(TextView(this).apply {
             text = "HISENSE A4  •  HDMI BACKUP: HDMI 3  •  AMBIENT: SLIDESHOW"
@@ -216,7 +216,7 @@ class MainActivity : Activity() {
         } catch (_: Exception) { null }
     }
 
-    private fun clearWallpaper() {
+    private fun clearWallpaperImage() {
         imageRequestId++
         if (::wallpaper.isInitialized) wallpaper.setImageDrawable(null)
         // Drop our reference and let Android reclaim the bitmap when no drawable uses it.
@@ -411,7 +411,7 @@ class MainActivity : Activity() {
         stopHeartbeat()
         reconnectRunnable?.let(mainHandler::removeCallbacks)
         socket?.cancel()
-        clearWallpaper()
+        clearWallpaperImage()
         imageExecutor.shutdownNow()
         super.onDestroy()
     }
