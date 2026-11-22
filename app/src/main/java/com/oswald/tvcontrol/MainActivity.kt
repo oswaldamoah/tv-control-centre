@@ -5,40 +5,108 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
+import android.media.tv.TvContract
+import android.media.tv.TvInputInfo
+import android.media.tv.TvInputManager
 import android.net.Uri
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.media.tv.TvInputInfo
-import android.media.tv.TvInputManager
 import android.provider.Settings
-import android.os.Bundle
+import android.text.InputType
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.*
 import okhttp3.*
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+/** Same green theme as before, with a little more depth. */
+private object Pal {
+    val BG_TOP = 0xFF0B2A1C.toInt()
+    val BG_BOTTOM = 0xFF04110B.toInt()
+    val SURFACE = 0xFF0F2F21.toInt()
+    val SURFACE_STROKE = 0xFF1B4733.toInt()
+    val FOCUS_FILL = 0xFF174A33.toInt()
+    val ACCENT = 0xFF7DE3A5.toInt()
+    val ACCENT_DEEP = 0xFF3FA66B.toInt()
+    val ON_ACCENT = 0xFF05241A.toInt()
+    val TEXT = 0xFFE8FFF1.toInt()
+    val MUTED = 0xFF9AC8AA.toInt()
+    val WARN = 0xFFFFD27D.toInt()
+    val ERROR = 0xFFFF8A80.toInt()
+}
+
+private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
 class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("tvcc", MODE_PRIVATE) }
     private var socket: WebSocket? = null
-    private lateinit var status: TextView
-    private lateinit var wallpaper: ImageView
+
+    // Slideshow
     private var slides = mutableListOf<String>()
+    private var slideIndex = 0
     private var currentBitmap: Bitmap? = null
     private var imageRequestId = 0
+    private var inAmbient = false
+    private var wallpaperFront: ImageView? = null
+    private var wallpaperBack: ImageView? = null
+    private var ambientOverlay: View? = null
     private val imageExecutor = Executors.newSingleThreadExecutor()
+
+    // Shared views that get refreshed in place
+    private var clockView: TextView? = null
+    private var dateView: TextView? = null
+    private var statusDot: View? = null
+    private var statusText: TextView? = null
+    private var shortcutBadge: TextView? = null
+    private var connLabel = "Checking laptop companion…"
+    private var connColor = Pal.WARN
+
+    // Timers and connection state
     private val mainHandler = Handler(Looper.getMainLooper())
     private var activityResumed = false
     private var reconnectDelayMs = 3_000L
     private var reconnectRunnable: Runnable? = null
     private var heartbeatRunnable: Runnable? = null
-    private var slideIndex = 0
     private val picker = 4101
-    private val client by lazy { OkHttpClient.Builder().pingInterval(30, TimeUnit.SECONDS).retryOnConnectionFailure(true).build() }
+
+    private val timeFmt by lazy { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+    private val dateFmt by lazy { SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()) }
+
+    private val client by lazy {
+        OkHttpClient.Builder().pingInterval(30, TimeUnit.SECONDS).retryOnConnectionFailure(true).build()
+    }
+
+    /** Keeps the clocks current and nudges the ambient overlay a few pixels each minute (burn-in protection). */
+    private val tick = object : Runnable {
+        override fun run() {
+            updateClock()
+            ambientOverlay?.translationX = ((SystemClock.elapsedRealtime() / 60_000L % 4L) * dp(10)).toFloat()
+            mainHandler.postDelayed(this, 15_000L)
+        }
+    }
+
+    private val slideTimer = object : Runnable {
+        override fun run() {
+            nextSlide()
+            mainHandler.postDelayed(this, SLIDE_INTERVAL_MS)
+        }
+    }
+
+    // ---------------------------------------------------------------- lifecycle
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,10 +121,16 @@ class MainActivity : Activity() {
         activityResumed = true
         connectCompanion()
         startHeartbeat()
+        mainHandler.removeCallbacks(tick)
+        mainHandler.post(tick)
+        refreshShortcutBadge()
+        if (inAmbient) startSlideTimer()
     }
 
     override fun onPause() {
         stopHeartbeat()
+        mainHandler.removeCallbacks(tick)
+        stopSlideTimer()
         super.onPause()
     }
 
@@ -73,6 +147,17 @@ class MainActivity : Activity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleShortcutIntent(intent)
+    }
+
+    override fun onDestroy() {
+        stopHeartbeat()
+        stopSlideTimer()
+        mainHandler.removeCallbacks(tick)
+        reconnectRunnable?.let(mainHandler::removeCallbacks)
+        socket?.cancel()
+        clearWallpaperImage()
+        imageExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     private fun handleShortcutIntent(intent: Intent?) {
@@ -93,108 +178,328 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun makeScreen(title: String): LinearLayout {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(48, 28, 48, 28)
-            setBackgroundColor(0xFF071B13.toInt())
-        }
-        root.addView(TextView(this).apply {
-            text = title; textSize = 28f; setTextColor(0xFFE8FFF1.toInt())
-        })
-        setContentView(root)
-        return root
+    // ---------------------------------------------------------------- ui helpers
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+    private fun rounded(fill: Int, radiusDp: Int, strokeColor: Int = 0, strokeDp: Int = 0) = GradientDrawable().apply {
+        setColor(fill)
+        cornerRadius = dp(radiusDp).toFloat()
+        if (strokeDp > 0) setStroke(dp(strokeDp), strokeColor)
     }
 
-    private fun button(parent: LinearLayout, label: String, action: () -> Unit) {
-        parent.addView(Button(this).apply {
-            text = label; textSize = 18f; isFocusable = true
-            setOnClickListener { action() }
-        }, LinearLayout.LayoutParams(-1, 68).apply { topMargin = 8 })
+    private fun backdrop() = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(Pal.BG_TOP, Pal.BG_BOTTOM))
+
+    private fun text(value: String, sizeSp: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+        text = value
+        textSize = sizeSp
+        setTextColor(color)
+        if (bold) typeface = Typeface.DEFAULT_BOLD
     }
+
+    private fun sectionLabel(label: String) = text(label, 15f, Pal.MUTED, bold = true).apply {
+        setPadding(dp(4), dp(24), 0, dp(10))
+    }
+
+    /** A focusable card. D-pad focus lifts and outlines it; no external drawables needed. */
+    private fun tile(
+        title: String,
+        subtitle: String? = null,
+        primary: Boolean = false,
+        subtitleColor: Int? = null,
+        minHeightDp: Int = 84,
+        action: () -> Unit
+    ): LinearLayout {
+        val fg = if (primary) Pal.ON_ACCENT else Pal.TEXT
+        val sub = subtitleColor ?: if (primary) Pal.ON_ACCENT else Pal.MUTED
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(minHeightDp)
+            setPadding(dp(22), dp(14), dp(22), dp(14))
+            isFocusable = true
+            isClickable = true
+            background = StateListDrawable().apply {
+                addState(
+                    intArrayOf(android.R.attr.state_focused),
+                    rounded(if (primary) Pal.ACCENT else Pal.FOCUS_FILL, 18, if (primary) Pal.TEXT else Pal.ACCENT, 3)
+                )
+                addState(
+                    intArrayOf(),
+                    rounded(if (primary) Pal.ACCENT_DEEP else Pal.SURFACE, 18, Pal.SURFACE_STROKE, 1)
+                )
+            }
+            setOnFocusChangeListener { v, hasFocus ->
+                val s = if (hasFocus) 1.04f else 1f
+                v.animate().scaleX(s).scaleY(s).setDuration(140).start()
+            }
+            setOnClickListener { action() }
+            addView(text(title, 20f, fg, bold = true).apply { maxLines = 1 })
+            if (subtitle != null) addView(text(subtitle, 14f, sub).apply { maxLines = 1; setPadding(0, dp(2), 0, 0) })
+        }
+    }
+
+    private fun row(vararg items: View): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        clipChildren = false
+        clipToPadding = false
+        items.forEachIndexed { i, v ->
+            addView(v, LinearLayout.LayoutParams(0, MATCH, 1f).apply { if (i > 0) marginStart = dp(12) })
+        }
+    }
+
+    private fun dialog() = AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+
+    // ---------------------------------------------------------------- dashboard
 
     private fun dashboard() {
+        inAmbient = false
+        stopSlideTimer()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         clearWallpaperImage()
-        val col = makeScreen("TV CONTROL CENTRE")
-        col.addView(TextView(this).apply {
-            text = "HISENSE A4  •  HDMI BACKUP: HDMI 3  •  AMBIENT: SLIDESHOW"
-            textSize = 14f; setTextColor(0xFF9AC8AA.toInt())
-        })
-        status = TextView(this).apply {
-            text = "Laptop companion: checking…"; textSize = 16f
-            setTextColor(0xFF7DE3A5.toInt()); setPadding(0, 16, 0, 8)
+        ambientOverlay = null
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = backdrop()
+            setPadding(dp(56), dp(40), dp(56), dp(32))
+            clipChildren = false
+            clipToPadding = false
         }
-        col.addView(status)
-        col.addView(TextView(this).apply {
-            text = if (shortcutServiceEnabled()) "REMOTE SHORTCUTS: ENABLED · HOLD 1–0 FOR 3 SECONDS" else "REMOTE SHORTCUTS: SETUP REQUIRED · 3-SECOND HOLD"
-            textSize = 13f
-            setTextColor(if (shortcutServiceEnabled()) 0xFF7DE3A5.toInt() else 0xFFFFD27D.toInt())
-            setPadding(0, 4, 0, 12)
+
+        // Left: the clock is the focal point, status sits quietly underneath.
+        val left = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        left.addView(text("TV Control Centre", 20f, Pal.ACCENT, bold = true))
+
+        val clock = text("--:--", 84f, Pal.TEXT).apply {
+            typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+            includeFontPadding = false
+            setPadding(0, dp(20), 0, 0)
+        }
+        clockView = clock
+        left.addView(clock)
+
+        val date = text("", 18f, Pal.MUTED)
+        dateView = date
+        left.addView(date)
+
+        left.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
+
+        val dot = View(this).apply {
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(connColor) }
+        }
+        statusDot = dot
+        val statusLabel = text(connLabel, 16f, Pal.TEXT)
+        statusText = statusLabel
+        val pill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(10), dp(20), dp(10))
+            background = rounded(Pal.SURFACE, 999, Pal.SURFACE_STROKE, 1)
+        }
+        pill.addView(dot, LinearLayout.LayoutParams(dp(10), dp(10)).apply { marginEnd = dp(12) })
+        pill.addView(statusLabel)
+        left.addView(pill, LinearLayout.LayoutParams(WRAP, WRAP))
+
+        val badge = text("", 14f, Pal.MUTED).apply { setPadding(dp(4), dp(14), 0, 0) }
+        shortcutBadge = badge
+        left.addView(badge)
+
+        left.addView(text("Hisense A4, with HDMI 3 as the backup input", 13f, Pal.MUTED).apply {
+            setPadding(dp(4), dp(8), 0, 0)
+            alpha = 0.75f
         })
-        button(col, "AMBIENT MODE") { ambient() }
-        button(col, "WIRELESS SCREEN SHARE") { launchShare() }
-        button(col, "HDMI INPUTS 1–4") { hdmiMenu() }
-        button(col, "HDMI 3 — BACKUP") { hdmi3() }
-        button(col, "RECOVERY OPTIONS") { recovery() }
-        button(col, "CHANGE SLIDESHOW IMAGES") { chooseImages() }
-        button(col, "REMOTE SHORTCUT SETUP") { shortcutSetup() }
-        button(col, "WINDOWS COMPANION SETTINGS") { companionSettings() }
-        button(col, "NORMAL HISENSE TV") { finish() }
+
+        // Right: scrollable tiles. Padding gives scaled tiles room so they never clip.
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            clipChildren = false
+            clipToPadding = false
+        }
+        fun addRow(vararg tiles: View) {
+            col.addView(row(*tiles), LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(12) })
+        }
+
+        col.addView(sectionLabel("Quick actions").apply { setPadding(dp(4), 0, 0, dp(10)) })
+        val ambientTile = tile("Ambient mode", "Clock and slideshow", primary = true, minHeightDp = 96) { ambient() }
+        addRow(ambientTile, tile("Screen share", "Cast wirelessly", minHeightDp = 96) { launchShare() })
+        // first row has no top margin
+        (col.getChildAt(1).layoutParams as LinearLayout.LayoutParams).topMargin = 0
+
+        col.addView(sectionLabel("HDMI inputs"))
+        val hdmi = (1..4).map { n ->
+            tile("HDMI $n", if (n == 3) "Backup" else null, subtitleColor = if (n == 3) Pal.ACCENT else null, minHeightDp = 72) {
+                selectHdmi(n)
+            }
+        }
+        col.addView(row(*hdmi.toTypedArray()), LinearLayout.LayoutParams(MATCH, WRAP))
+
+        col.addView(sectionLabel("Settings and recovery"))
+        val host = prefs.getString("pc_ip", DEFAULT_IP).orEmpty()
+        addRow(
+            tile("Recovery", "Share, HDMI 3, home") { recovery() },
+            tile("Slideshow images", "${slides.size} selected") { chooseImages() }
+        )
+        addRow(
+            tile("Remote shortcuts", "Hold a number key for 3 seconds") { shortcutSetup() },
+            tile("Windows companion", host) { companionSettings() }
+        )
+        addRow(tile("Back to Hisense TV", "Close this app", minHeightDp = 72) { finish() })
+
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            clipChildren = false
+            clipToPadding = false
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            addView(col, FrameLayout.LayoutParams(MATCH, WRAP))
+        }
+
+        root.addView(left, LinearLayout.LayoutParams(0, MATCH, 0.36f))
+        root.addView(scroll, LinearLayout.LayoutParams(0, MATCH, 0.64f).apply { marginStart = dp(40) })
+        setContentView(root)
+
+        applyStatus()
+        updateClock()
+        refreshShortcutBadge()
+        ambientTile.requestFocus()
     }
 
-    private fun ambient() {
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val frame = FrameLayout(this).apply { setBackgroundColor(0xFF071B13.toInt()) }
-        wallpaper = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-        frame.addView(wallpaper, FrameLayout.LayoutParams(-1, -1))
-        val overlay = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; gravity = Gravity.BOTTOM
-            setPadding(48, 28, 48, 40); setBackgroundColor(0x66071912)
+    private fun setConnection(label: String, color: Int) {
+        connLabel = label
+        connColor = color
+        applyStatus()
+    }
+
+    private fun applyStatus() {
+        statusText?.text = connLabel
+        (statusDot?.background as? GradientDrawable)?.setColor(connColor)
+    }
+
+    private fun refreshShortcutBadge() {
+        val on = shortcutServiceEnabled()
+        shortcutBadge?.apply {
+            text = if (on) "Remote shortcuts are on" else "Remote shortcuts need setup"
+            setTextColor(if (on) Pal.ACCENT else Pal.WARN)
         }
-        overlay.addView(TextView(this).apply {
-            text = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
-            textSize = 56f; setTextColor(-1)
-        })
-        overlay.addView(TextView(this).apply {
-            text = java.text.SimpleDateFormat("EEEE, d MMMM yyyy", java.util.Locale.getDefault()).format(java.util.Date())
-            textSize = 20f; setTextColor(0xFFE0F4E7.toInt())
-        })
-        frame.addView(overlay, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
-        frame.isFocusableInTouchMode = true
+    }
+
+    private fun updateClock() {
+        val now = Date()
+        clockView?.text = timeFmt.format(now)
+        dateView?.text = dateFmt.format(now)
+    }
+
+    // ---------------------------------------------------------------- ambient mode
+
+    private fun ambient() {
+        inAmbient = true
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        val frame = FrameLayout(this).apply {
+            background = backdrop()
+            isFocusableInTouchMode = true
+        }
+        // Two layers so slides crossfade instead of snapping.
+        val front = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        val back = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; alpha = 0f }
+        wallpaperFront = front
+        wallpaperBack = back
+        frame.addView(front, FrameLayout.LayoutParams(MATCH, MATCH))
+        frame.addView(back, FrameLayout.LayoutParams(MATCH, MATCH))
+
+        val scrim = View(this).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(0x00030D08, 0xDD030D08.toInt())
+            )
+        }
+        frame.addView(scrim, FrameLayout.LayoutParams(MATCH, dp(320), Gravity.BOTTOM))
+
+        val overlay = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(56), 0, dp(56), dp(44))
+        }
+        val clock = text("--:--", 76f, -1).apply {
+            typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+            includeFontPadding = false
+        }
+        val date = text("", 20f, Pal.TEXT)
+        clockView = clock
+        dateView = date
+        overlay.addView(clock)
+        overlay.addView(date)
+        if (slides.isEmpty()) {
+            overlay.addView(text("No slideshow images yet. Press Back, then choose Slideshow images.", 14f, Pal.MUTED).apply {
+                setPadding(0, dp(12), 0, 0)
+            })
+        }
+        ambientOverlay = overlay
+        frame.addView(overlay, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM))
+
         frame.setOnKeyListener { _, key, event ->
-            if (event.action != android.view.KeyEvent.ACTION_DOWN) return@setOnKeyListener false
+            if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
             when (key) {
-                android.view.KeyEvent.KEYCODE_DPAD_CENTER, android.view.KeyEvent.KEYCODE_ENTER,
-                android.view.KeyEvent.KEYCODE_MEDIA_NEXT -> { nextSlide(); true }
-                android.view.KeyEvent.KEYCODE_BACK, android.view.KeyEvent.KEYCODE_MENU -> { dashboard(); true }
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_MEDIA_NEXT -> { nextSlide(); true }
+                KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_MENU -> { dashboard(); true }
                 else -> false
             }
         }
-        setContentView(frame); frame.requestFocus(); renderSlide()
+        setContentView(frame)
+        frame.requestFocus()
+        updateClock()
+        renderSlide()
+        startSlideTimer()
     }
+
+    private fun startSlideTimer() {
+        stopSlideTimer()
+        if (inAmbient && slides.size > 1 && SLIDE_INTERVAL_MS > 0) mainHandler.postDelayed(slideTimer, SLIDE_INTERVAL_MS)
+    }
+
+    private fun stopSlideTimer() = mainHandler.removeCallbacks(slideTimer)
 
     /** Decode wallpapers off the UI thread and downsample them to TV-sized images. */
     private fun renderSlide() {
-        if (slides.isEmpty()) return
+        if (!inAmbient || slides.isEmpty()) return
         if (slideIndex >= slides.size) slideIndex = 0
         val uri = Uri.parse(slides[slideIndex])
         val requestId = ++imageRequestId
-        imageExecutor.execute {
-            val decoded = decodeWallpaper(uri, 1280, 720)
-            mainHandler.post {
-                if (requestId != imageRequestId || isFinishing || isDestroyed) {
-                    decoded?.takeUnless { it.isRecycled }?.recycle()
-                    return@post
-                }
-                if (decoded != null) {
-                    // Do not manually recycle a bitmap after assigning it to ImageView.
-                    // The view/compositor may still be drawing the previous drawable.
-                    wallpaper.setImageBitmap(decoded)
-                    currentBitmap = decoded
+        try {
+            imageExecutor.execute {
+                val decoded = decodeWallpaper(uri, TARGET_W, TARGET_H)
+                mainHandler.post {
+                    if (decoded == null) return@post
+                    if (requestId != imageRequestId || isFinishing || isDestroyed) {
+                        if (!decoded.isRecycled) decoded.recycle()
+                        return@post
+                    }
+                    showBitmap(decoded)
                 }
             }
+        } catch (_: Exception) { /* executor already shut down */ }
+    }
+
+    private fun showBitmap(bmp: Bitmap) {
+        val front = wallpaperFront ?: return
+        val back = wallpaperBack ?: return
+        currentBitmap = bmp
+        // Never recycle a bitmap that an ImageView may still be drawing.
+        if (front.drawable == null) {
+            front.setImageBitmap(bmp)
+            front.alpha = 0f
+            front.animate().alpha(1f).setDuration(600).start()
+            return
         }
+        back.animate().cancel()
+        back.setImageBitmap(bmp)
+        back.alpha = 0f
+        back.animate().alpha(1f).setDuration(900).withEndAction {
+            front.setImageBitmap(bmp)
+            back.alpha = 0f
+            back.setImageDrawable(null)
+        }.start()
     }
 
     private fun decodeWallpaper(uri: Uri, reqWidth: Int, reqHeight: Int): Bitmap? {
@@ -218,18 +523,30 @@ class MainActivity : Activity() {
 
     private fun clearWallpaperImage() {
         imageRequestId++
-        if (::wallpaper.isInitialized) wallpaper.setImageDrawable(null)
+        wallpaperFront?.animate()?.cancel()
+        wallpaperBack?.animate()?.cancel()
+        wallpaperFront?.setImageDrawable(null)
+        wallpaperBack?.setImageDrawable(null)
+        wallpaperFront = null
+        wallpaperBack = null
         // Drop our reference and let Android reclaim the bitmap when no drawable uses it.
         currentBitmap = null
     }
 
     private fun nextSlide() {
-        if (slides.isNotEmpty()) { slideIndex = (slideIndex + 1) % slides.size; renderSlide() }
+        if (slides.isEmpty()) return
+        slideIndex = (slideIndex + 1) % slides.size
+        renderSlide()
+        // restart the countdown so a manual skip isn't followed by an instant auto-skip
+        startSlideTimer()
     }
+
+    // ---------------------------------------------------------------- image picker
 
     private fun chooseImages() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            type = "image/*"; putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            type = "image/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
             addCategory(Intent.CATEGORY_OPENABLE)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         }
@@ -252,6 +569,8 @@ class MainActivity : Activity() {
         ambient()
     }
 
+    // ---------------------------------------------------------------- TV actions
+
     private fun launchShare() {
         val i = packageManager.getLaunchIntentForPackage("com.mediatek.androidbox")
         if (i != null) startActivity(i) else toast("Screen Share has no exposed launch activity. Use the original TV app menu.")
@@ -259,15 +578,12 @@ class MainActivity : Activity() {
 
     private fun hdmi3() = selectHdmi(3)
 
-    private fun hdmiMenu() {
-        AlertDialog.Builder(this).setTitle("Select HDMI input")
-            .setItems(arrayOf("HDMI 1", "HDMI 2", "HDMI 3 · Backup", "HDMI 4")) { _, which -> selectHdmi(which + 1) }
-            .show()
-    }
-
     private fun shortcutServiceEnabled(): Boolean {
         val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES).orEmpty()
-        return enabled.split(':').any { it.equals("$packageName/.RemoteShortcutService", true) || it.equals("$packageName/${RemoteShortcutService::class.java.name}", true) }
+        return enabled.split(':').any {
+            it.equals("$packageName/.RemoteShortcutService", true) ||
+                it.equals("$packageName/${RemoteShortcutService::class.java.name}", true)
+        }
     }
 
     private fun selectHdmi(number: Int) {
@@ -288,8 +604,7 @@ class MainActivity : Activity() {
                 toast("HDMI $number was not identified by this TV firmware. Use INPUT on the remote.")
                 return
             }
-            val uri = android.media.tv.TvContract.buildChannelUriForPassthroughInput(inputId)
-            startActivity(Intent(Intent.ACTION_VIEW, uri))
+            startActivity(Intent(Intent.ACTION_VIEW, TvContract.buildChannelUriForPassthroughInput(inputId)))
         } catch (_: Exception) {
             toast("HDMI $number selection is not exposed by this firmware. Use the remote INPUT button.")
         }
@@ -301,9 +616,13 @@ class MainActivity : Activity() {
     }
 
     private fun shortcutSetup() {
-        AlertDialog.Builder(this).setTitle("3-second remote shortcuts")
-            .setMessage("Hold a number key continuously for 3 seconds to run its action. Shorter presses are not used by this app and should continue to the foreground TV app.\n\n1 HDMI 1  •  2 HDMI 2  •  3 HDMI 3  •  4 HDMI 4\n5 Screen Share  •  6 Wi-Fi settings\n7 Ambient Mode  •  8 Dashboard\n9 Next background  •  0 HDMI 3\n\nEnable TV Control Centre under Settings → Accessibility. Some Hisense firmware versions may not deliver global IR key events to third-party accessibility services.")
-            .setPositiveButton("Open Accessibility Settings") { _, _ ->
+        dialog().setTitle("3-second remote shortcuts")
+            .setMessage(
+                "Hold a number key continuously for 3 seconds to run its action. Shorter presses are not used by this app and continue to the foreground TV app.\n\n" +
+                    "1 to 4: HDMI 1 to 4\n5: Screen Share\n6: Wi-Fi settings\n7: Ambient mode\n8: Dashboard\n9: Next background\n0: HDMI 3\n\n" +
+                    "Enable TV Control Centre under Settings → Accessibility. Some Hisense firmware versions may not deliver global IR key events to third-party accessibility services."
+            )
+            .setPositiveButton("Open accessibility settings") { _, _ ->
                 try { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
                 catch (_: Exception) { toast("Open Accessibility in TV Settings.") }
             }.setNegativeButton("Close", null).show()
@@ -311,29 +630,37 @@ class MainActivity : Activity() {
 
     private fun companionSettings() {
         val field = EditText(this).apply {
-            inputType = android.text.InputType.TYPE_CLASS_TEXT
-            setText(prefs.getString("pc_ip", "192.168.8.159"))
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine()
+            setText(prefs.getString("pc_ip", DEFAULT_IP))
             hint = "Windows PC IPv4 address"
         }
-        AlertDialog.Builder(this).setTitle("Windows companion IP")
+        val holder = FrameLayout(this).apply {
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(field, FrameLayout.LayoutParams(MATCH, WRAP))
+        }
+        dialog().setTitle("Windows companion IP")
             .setMessage("Enter the Windows PC IPv4 address shown in the companion app.")
-            .setView(field)
+            .setView(holder)
             .setPositiveButton("Save and reconnect") { _, _ ->
                 val host = field.text.toString().trim()
                 if (host.isNotBlank()) {
                     prefs.edit().putString("pc_ip", host).apply()
                     socket?.close(1000, "IP changed")
                     connectCompanion()
+                    if (!inAmbient) dashboard() // refresh the address shown on the tile
                 }
             }.setNegativeButton("Cancel", null).show()
     }
 
     private fun recovery() {
-        AlertDialog.Builder(this).setTitle("Recovery options")
+        dialog().setTitle("Recovery options")
             .setItems(arrayOf("Reopen Screen Share", "Switch to HDMI 3", "Return to dashboard")) { _, which ->
                 when (which) { 0 -> launchShare(); 1 -> hdmi3(); else -> dashboard() }
             }.show()
     }
+
+    // ---------------------------------------------------------------- companion socket
 
     private fun connectCompanion() {
         if (!activityResumed) return
@@ -341,39 +668,54 @@ class MainActivity : Activity() {
         reconnectRunnable = null
         socket?.cancel()
         socket = null
-        val host = prefs.getString("pc_ip", "192.168.8.159")!!
+        setConnection("Connecting to laptop…", Pal.WARN)
+        val host = prefs.getString("pc_ip", DEFAULT_IP)!!
         val request = try { Request.Builder().url("ws://$host:8765").build() }
-            catch (_: Exception) { scheduleReconnect(); return }
+            catch (_: Exception) {
+                setConnection("Invalid laptop address", Pal.ERROR)
+                scheduleReconnect()
+                return
+            }
         socket = client.newWebSocket(request, object : WebSocketListener() {
+            // Callbacks from a socket we already replaced or closed are ignored (ws !== socket).
             override fun onOpen(ws: WebSocket, response: Response) {
                 reconnectDelayMs = 3_000L
-                runOnUiThread { if (::status.isInitialized) status.text = "Laptop companion: connected" }
+                runOnUiThread { if (ws === socket) setConnection("Laptop connected", Pal.ACCENT) }
                 ws.send("{\"type\":\"hello\",\"device\":\"Hisense A4\",\"hdmiBackup\":\"HDMI 3\"}")
             }
+
             override fun onMessage(ws: WebSocket, text: String) {
                 try {
-                    when (JSONObject(text).optString("command")) {
-                        "ambient" -> runOnUiThread { ambient() }
-                        "dashboard" -> runOnUiThread { dashboard() }
-                        "screen_share" -> runOnUiThread { launchShare() }
-                        "hdmi1" -> runOnUiThread { selectHdmi(1) }
-                        "hdmi2" -> runOnUiThread { selectHdmi(2) }
-                        "hdmi3" -> runOnUiThread { hdmi3() }
-                        "hdmi4" -> runOnUiThread { selectHdmi(4) }
-                        "wifi_recovery" -> runOnUiThread { openWifiRecovery() }
-                        "next_wallpaper" -> runOnUiThread { nextSlide() }
+                    val command = JSONObject(text).optString("command")
+                    runOnUiThread {
+                        if (ws !== socket) return@runOnUiThread
+                        when (command) {
+                            "ambient" -> ambient()
+                            "dashboard" -> dashboard()
+                            "screen_share" -> launchShare()
+                            "hdmi1" -> selectHdmi(1)
+                            "hdmi2" -> selectHdmi(2)
+                            "hdmi3" -> hdmi3()
+                            "hdmi4" -> selectHdmi(4)
+                            "wifi_recovery" -> openWifiRecovery()
+                            "next_wallpaper" -> nextSlide()
+                        }
                     }
                 } catch (_: Exception) {}
             }
+
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 runOnUiThread {
-                    if (::status.isInitialized) status.text = "Laptop offline — reconnecting…"
+                    if (ws !== socket) return@runOnUiThread
+                    setConnection("Laptop offline, retrying…", Pal.ERROR)
                     scheduleReconnect()
                 }
             }
+
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 runOnUiThread {
-                    if (::status.isInitialized && activityResumed) status.text = "Laptop companion: disconnected"
+                    if (ws !== socket) return@runOnUiThread
+                    if (activityResumed) setConnection("Laptop disconnected", Pal.WARN)
                     if (activityResumed && code != 1000) scheduleReconnect()
                 }
             }
@@ -407,16 +749,15 @@ class MainActivity : Activity() {
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
-    override fun onDestroy() {
-        stopHeartbeat()
-        reconnectRunnable?.let(mainHandler::removeCallbacks)
-        socket?.cancel()
-        clearWallpaperImage()
-        imageExecutor.shutdownNow()
-        super.onDestroy()
-    }
+
     companion object {
         const val ACTION_REMOTE_SHORTCUT = "com.oswald.tvcontrol.REMOTE_SHORTCUT"
         const val EXTRA_SHORTCUT_DIGIT = "shortcut_digit"
+        private const val DEFAULT_IP = "192.168.8.159"
+        /** Auto-advance interval for the ambient slideshow. Set to 0 to go back to manual-only. */
+        private const val SLIDE_INTERVAL_MS = 45_000L
+        /** Decode target. Raise to 1920x1080 if the TV has RAM to spare and 720p looks soft. */
+        private const val TARGET_W = 1280
+        private const val TARGET_H = 720
     }
 }
