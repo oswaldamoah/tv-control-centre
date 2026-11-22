@@ -70,3 +70,63 @@ This source archive has **not** been built or tested on the physical Hisense TV 
 - Live TV-to-PC mirroring is not implemented. It requires TV-side MediaProjection consent, a foreground capture service and video transport/decoder; protected apps may block capture.
 - A persistent Android background WebSocket service, automatic reconnect, PC-to-TV image transfer and full HDMI firmware compatibility remain future work.
 - Screen Share depends on the vendor package exposing a launchable activity.
+
+
+## Lightweight build and TV health diagnostics
+
+This revision focuses on reducing the app's own memory and UI-thread load:
+
+- Ambient wallpapers are decoded on a background worker instead of the Android main/UI thread.
+- Wallpapers are downsampled before display and decoded as `RGB_565` to reduce bitmap memory use.
+- The previous wallpaper bitmap is released when replaced, and wallpaper memory is cleared when returning to the dashboard.
+- `FLAG_KEEP_SCREEN_ON` is used only in Ambient Mode, not across the entire dashboard session.
+- The Windows Companion connection reconnects with capped backoff while the TV app is in the foreground, and disconnects when the app leaves the foreground.
+- A lightweight five-second main-thread heartbeat is sent to the Windows Companion. If the socket remains connected but heartbeats stop, the companion marks the TV app as potentially stalled. This is a diagnostic signal, not proof that the entire TV operating system is frozen.
+
+### Important recovery limitations
+
+The current build does **not** silently restart the TV's Wi-Fi or Screen Share system service, automatically switch HDMI after a freeze, or reboot the television. Those actions need a separate recovery controller and device-specific testing.
+
+A third-party Android app generally cannot reboot the TV itself: Android documents `PowerManager.reboot()` as requiring the privileged `REBOOT` permission, which is not intended for ordinary third-party apps. A TV-side app may also stop executing when the TV's UI/system is frozen. An independent Windows Companion/ADB controller is therefore the more reliable place to host a watchdog, provided the TV is reachable over the network and ADB debugging has been explicitly enabled and authorized.
+
+Android TV also has background-execution restrictions. This app deliberately does not add a permanent foreground service just to poll the TV. The heartbeat runs only while the app is in the foreground. The Windows Companion can therefore identify a stalled foreground app, but cannot infer a whole-TV freeze from a missing heartbeat alone.
+
+### Suggested recovery design for the next milestone
+
+1. Detect a missing app heartbeat for a sustained period and confirm the TV is not simply in the background or disconnected from Wi-Fi.
+2. Use the Windows Companion to check whether the TV is still reachable and whether ADB responds.
+3. If ADB responds, attempt a controlled app/service recovery twice, recording each result.
+4. If the TV is responsive but the current source/session is unusable, request HDMI 3 as the fallback.
+5. Only if the TV remains unresponsive and ADB still accepts commands, offer or perform a configured `adb reboot` after a clear timeout and safety guard.
+6. If neither network nor ADB responds, software running on the TV or PC cannot guarantee a restart. Manual power cycling may be required.
+
+The recovery sequence must be tested on the actual Hisense firmware before enabling unattended automatic reboot. HDMI switching and Screen Share relaunch commands are vendor-specific and may not be exposed by the TV.
+
+
+## Stability-first revision
+
+This revision prioritizes reducing work performed on the TV and avoiding unsafe bitmap lifecycle operations. It does not claim to have identified the TV firmware's root cause without device-side logs.
+
+### Changes in this revision
+
+- Reduced wallpaper decode target from 1920×1080 to 1280×720 and retained RGB_565 decoding to reduce bitmap memory pressure.
+- Removed manual recycling of bitmaps after they have been assigned to an `ImageView`. Android may still be drawing the previous drawable; recycling it immediately can cause rendering failures. The app now drops its reference and lets Android reclaim the bitmap.
+- Simplified the global shortcut listener to one delayed task per key press instead of rescheduling a recursive runnable. It still fires once after a continuous 3-second hold and always returns `false` so the original key event is not consumed.
+- Disabled Android app backup to avoid unnecessary backup work for this utility app.
+
+### Important isolation test for freezes
+
+Because the freezes reportedly began immediately after installing the app and enabling remote shortcuts, first test the app with its Accessibility Service **disabled**. Use TV Settings → Accessibility → TV Control Centre remote shortcuts → Off. Run the TV normally for a comparable period. If freezes stop, keep the shortcut service disabled while investigating firmware key-event behaviour. If freezes continue with the service disabled and the app uninstalled, the cause is likely outside this app (TV firmware, Wi-Fi/router, HDMI device, or another system app).
+
+Do not leave the dashboard or Ambient Mode running just to monitor the TV. Exit the app when it is not needed. Ambient Mode is an optional foreground screen, not a system screensaver or watchdog.
+
+### What this app cannot safely guarantee
+
+- A missing heartbeat does not prove the whole TV has frozen. The app heartbeat runs only while the activity is foregrounded.
+- When Android itself is frozen, an app on that TV cannot reliably repair Wi-Fi, switch HDMI, or reboot the TV.
+- HDMI 3 switching and vendor Screen Share relaunch depend on Hisense firmware support.
+- Do not automatically power-cycle the TV based only on a missed heartbeat. A false positive could interrupt normal use or a firmware update. An external power controller should use independent network/ADB checks, a long confirmation window, and safeguards against cycling during updates.
+
+### Validation status
+
+Source-level checks can verify Kotlin structure, XML validity, and Windows Python syntax, but only a successful Gradle build and a sustained test on the physical Hisense A4 can establish that this revision improves stability. Record Android logcat around any repeat freeze before concluding the cause is fixed.

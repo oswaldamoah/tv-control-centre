@@ -3,8 +3,12 @@ package com.oswald.tvcontrol
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.media.tv.TvInputInfo
 import android.media.tv.TvInputManager
 import android.provider.Settings
@@ -16,6 +20,7 @@ import android.widget.*
 import okhttp3.*
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("tvcc", MODE_PRIVATE) }
@@ -23,18 +28,45 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var wallpaper: ImageView
     private var slides = mutableListOf<String>()
+    private var currentBitmap: Bitmap? = null
+    private var imageRequestId = 0
+    private val imageExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var activityResumed = false
+    private var reconnectDelayMs = 3_000L
+    private var reconnectRunnable: Runnable? = null
+    private var heartbeatRunnable: Runnable? = null
     private var slideIndex = 0
     private val picker = 4101
-    private val client by lazy { OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build() }
+    private val client by lazy { OkHttpClient.Builder().pingInterval(30, TimeUnit.SECONDS).retryOnConnectionFailure(true).build() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.decorView.systemUiVisibility = 5894
         slides = prefs.getString("slides", "").orEmpty().split("\n").filter { it.isNotBlank() }.toMutableList()
         dashboard()
-        connectCompanion()
         handleShortcutIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        activityResumed = true
+        connectCompanion()
+        startHeartbeat()
+    }
+
+    override fun onPause() {
+        stopHeartbeat()
+        super.onPause()
+    }
+
+    override fun onStop() {
+        activityResumed = false
+        reconnectRunnable?.let(mainHandler::removeCallbacks)
+        reconnectRunnable = null
+        socket?.close(1000, "TV app not in foreground")
+        socket = null
+        super.onStop()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -82,6 +114,8 @@ class MainActivity : Activity() {
     }
 
     private fun dashboard() {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        clearWallpaper()
         val col = makeScreen("TV CONTROL CENTRE")
         col.addView(TextView(this).apply {
             text = "HISENSE A4  •  HDMI BACKUP: HDMI 3  •  AMBIENT: SLIDESHOW"
@@ -110,6 +144,7 @@ class MainActivity : Activity() {
     }
 
     private fun ambient() {
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val frame = FrameLayout(this).apply { setBackgroundColor(0xFF071B13.toInt()) }
         wallpaper = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
         frame.addView(wallpaper, FrameLayout.LayoutParams(-1, -1))
@@ -139,14 +174,53 @@ class MainActivity : Activity() {
         setContentView(frame); frame.requestFocus(); renderSlide()
     }
 
+    /** Decode wallpapers off the UI thread and downsample them to TV-sized images. */
     private fun renderSlide() {
         if (slides.isEmpty()) return
         if (slideIndex >= slides.size) slideIndex = 0
-        try {
-            contentResolver.openInputStream(Uri.parse(slides[slideIndex])).use {
-                wallpaper.setImageBitmap(BitmapFactory.decodeStream(it))
+        val uri = Uri.parse(slides[slideIndex])
+        val requestId = ++imageRequestId
+        imageExecutor.execute {
+            val decoded = decodeWallpaper(uri, 1280, 720)
+            mainHandler.post {
+                if (requestId != imageRequestId || isFinishing || isDestroyed) {
+                    decoded?.takeUnless { it.isRecycled }?.recycle()
+                    return@post
+                }
+                if (decoded != null) {
+                    // Do not manually recycle a bitmap after assigning it to ImageView.
+                    // The view/compositor may still be drawing the previous drawable.
+                    wallpaper.setImageBitmap(decoded)
+                    currentBitmap = decoded
+                }
             }
-        } catch (_: Exception) {}
+        }
+    }
+
+    private fun decodeWallpaper(uri: Uri, reqWidth: Int, reqHeight: Int): Bitmap? {
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            val largestRatio = maxOf(
+                bounds.outWidth.toDouble() / reqWidth,
+                bounds.outHeight.toDouble() / reqHeight
+            )
+            var sample = 1
+            while (sample < largestRatio) sample *= 2
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+        } catch (_: Exception) { null }
+    }
+
+    private fun clearWallpaper() {
+        imageRequestId++
+        if (::wallpaper.isInitialized) wallpaper.setImageDrawable(null)
+        // Drop our reference and let Android reclaim the bitmap when no drawable uses it.
+        currentBitmap = null
     }
 
     private fun nextSlide() {
@@ -262,11 +336,17 @@ class MainActivity : Activity() {
     }
 
     private fun connectCompanion() {
-        // Replace with the Windows PC's IPv4 address before installing.
+        if (!activityResumed) return
+        reconnectRunnable?.let(mainHandler::removeCallbacks)
+        reconnectRunnable = null
+        socket?.cancel()
+        socket = null
         val host = prefs.getString("pc_ip", "192.168.8.159")!!
-        val request = Request.Builder().url("ws://$host:8765").build()
+        val request = try { Request.Builder().url("ws://$host:8765").build() }
+            catch (_: Exception) { scheduleReconnect(); return }
         socket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
+                reconnectDelayMs = 3_000L
                 runOnUiThread { if (::status.isInitialized) status.text = "Laptop companion: connected" }
                 ws.send("{\"type\":\"hello\",\"device\":\"Hisense A4\",\"hdmiBackup\":\"HDMI 3\"}")
             }
@@ -286,16 +366,55 @@ class MainActivity : Activity() {
                 } catch (_: Exception) {}
             }
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                runOnUiThread { if (::status.isInitialized) status.text = "Laptop offline — remote controls remain available" }
+                runOnUiThread {
+                    if (::status.isInitialized) status.text = "Laptop offline — reconnecting…"
+                    scheduleReconnect()
+                }
             }
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                runOnUiThread { if (::status.isInitialized) status.text = "Laptop companion: disconnected" }
+                runOnUiThread {
+                    if (::status.isInitialized && activityResumed) status.text = "Laptop companion: disconnected"
+                    if (activityResumed && code != 1000) scheduleReconnect()
+                }
             }
         })
     }
 
+    private fun scheduleReconnect() {
+        if (!activityResumed || reconnectRunnable != null) return
+        val delay = reconnectDelayMs
+        reconnectDelayMs = (reconnectDelayMs * 2).coerceAtMost(30_000L)
+        reconnectRunnable = Runnable {
+            reconnectRunnable = null
+            connectCompanion()
+        }.also { mainHandler.postDelayed(it, delay) }
+    }
+
+    /** Main-thread heartbeat lets the Windows companion distinguish a live UI from a dead socket. */
+    private fun startHeartbeat() {
+        stopHeartbeat()
+        heartbeatRunnable = object : Runnable {
+            override fun run() {
+                socket?.send("{\"type\":\"heartbeat\",\"uptimeMs\":${SystemClock.elapsedRealtime()}}")
+                if (activityResumed) mainHandler.postDelayed(this, 5_000L)
+            }
+        }.also { mainHandler.postDelayed(it, 5_000L) }
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatRunnable?.let(mainHandler::removeCallbacks)
+        heartbeatRunnable = null
+    }
+
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
-    override fun onDestroy() { socket?.close(1000, "closing"); super.onDestroy() }
+    override fun onDestroy() {
+        stopHeartbeat()
+        reconnectRunnable?.let(mainHandler::removeCallbacks)
+        socket?.cancel()
+        clearWallpaper()
+        imageExecutor.shutdownNow()
+        super.onDestroy()
+    }
     companion object {
         const val ACTION_REMOTE_SHORTCUT = "com.oswald.tvcontrol.REMOTE_SHORTCUT"
         const val EXTRA_SHORTCUT_DIGIT = "shortcut_digit"

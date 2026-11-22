@@ -3,26 +3,32 @@ import asyncio
 import json
 import socket
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 import websockets
 
 PORT = 8765
 clients = set()
+last_heartbeat = {}
 loop = None
 
 async def handler(ws):
     clients.add(ws)
+    last_heartbeat[ws] = time.monotonic()
     try:
         async for raw in ws:
             try:
                 msg = json.loads(raw)
-                if msg.get("type") == "hello":
-                    print("TV connected:", msg)
+                if msg.get("type") in ("hello", "heartbeat"):
+                    last_heartbeat[ws] = time.monotonic()
+                    if msg.get("type") == "hello":
+                        print("TV connected:", msg)
             except (ValueError, TypeError):
                 pass
     finally:
         clients.discard(ws)
+        last_heartbeat.pop(ws, None)
 
 async def server():
     async with websockets.serve(handler, "0.0.0.0", PORT, ping_interval=20, ping_timeout=20):
@@ -81,6 +87,19 @@ def main():
     ttk.Label(network, text="CONNECTION", style="Section.TLabel").pack(anchor="w")
     ttk.Label(network, text=f"PC IPv4 address: {pc_ip()}     WebSocket port: {PORT}", style="TLabel").pack(anchor="w", pady=(8, 3))
     ttk.Label(network, text="Enter this IPv4 address in the TV app: Dashboard → Windows Companion Settings.", style="Sub.TLabel").pack(anchor="w")
+    health_status = ttk.Label(network, text="TV health: waiting for connection…", style="Section.TLabel")
+    health_status.pack(anchor="w", pady=(10, 0))
+
+    def refresh_health_status():
+        now = time.monotonic()
+        recent = [stamp for stamp in last_heartbeat.values() if now - stamp <= 15]
+        if recent:
+            health_status.configure(text="TV health: app responsive · heartbeat received")
+        elif clients:
+            health_status.configure(text="TV health: no recent app heartbeat · possible app/UI stall")
+        else:
+            health_status.configure(text="TV health: TV app disconnected or network unavailable")
+        app.after(3000, refresh_health_status)
 
     panel = ttk.Frame(outer, style="Panel.TFrame", padding=16)
     panel.pack(fill="both", expand=True)
@@ -106,6 +125,7 @@ def main():
     ttk.Label(outer, text="LIVE TV MIRROR  ·  NOT IMPLEMENTED", font=("Segoe UI", 10, "bold"), foreground="#f0c778").pack(anchor="w", pady=(16, 4))
     ttk.Label(outer, text="Video mirroring needs a TV-side capture permission flow and streaming pipeline. Protected apps may prevent capture.", style="Sub.TLabel", wraplength=700).pack(anchor="w")
     ttk.Label(outer, text="Keep the TV and PC on the same Wi-Fi/LAN. Allow Python through Windows Firewall on Private networks.", style="Sub.TLabel", wraplength=700).pack(anchor="w", pady=(10, 0))
+    app.after(1000, refresh_health_status)
     app.mainloop()
 
 if __name__ == "__main__":

@@ -9,20 +9,12 @@ import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 
-/**
- * Observes global remote number-key events. Events are never consumed, so a
- * tap shorter than 3 seconds continues to the foreground TV application.
- * A shortcut is launched once when a continuous hold reaches 3,000 ms.
- */
+/** Optional, low-workload global number-key listener. */
 class RemoteShortcutService : AccessibilityService() {
-    private data class Press(
-        val startedAt: Long,
-        var fired: Boolean = false,
-        var task: Runnable? = null
-    )
+    private data class Press(val startedAt: Long, var fired: Boolean = false, var task: Runnable? = null)
 
     private val handler = Handler(Looper.getMainLooper())
-    private val presses = mutableMapOf<Int, Press>()
+    private val presses = HashMap<Int, Press>()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -30,48 +22,40 @@ class RemoteShortcutService : AccessibilityService() {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = flags or AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
-            notificationTimeout = 0
+            notificationTimeout = 100
         }
     }
 
     override fun onKeyEvent(event: KeyEvent): Boolean {
         val digit = digitFor(event.keyCode) ?: return false
         when (event.action) {
-            KeyEvent.ACTION_DOWN -> {
-                if (event.repeatCount == 0 && !presses.containsKey(event.keyCode)) {
-                    val press = Press(startedAt = event.downTime)
-                    presses[event.keyCode] = press
-                    press.task = thisRunnable(event.keyCode, press, digit)
-                    handler.postDelayed(press.task!!, HOLD_THRESHOLD_MS)
-                }
-            }
-            KeyEvent.ACTION_UP -> {
-                val press = presses.remove(event.keyCode)
-                if (press != null) {
-                    press.task?.let(handler::removeCallbacks)
-                    val heldFor = event.eventTime - press.startedAt
-                    if (!press.fired && heldFor >= HOLD_THRESHOLD_MS) {
+            KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0 && !presses.containsKey(event.keyCode)) {
+                val press = Press(event.downTime)
+                presses[event.keyCode] = press
+                val task = Runnable {
+                    val active = presses[event.keyCode]
+                    if (active === press && !press.fired &&
+                        SystemClock.uptimeMillis() - press.startedAt >= HOLD_THRESHOLD_MS) {
                         press.fired = true
                         launchShortcut(digit)
                     }
                 }
+                press.task = task
+                handler.postDelayed(task, HOLD_THRESHOLD_MS)
             }
+            KeyEvent.ACTION_UP -> {
+                val press = presses.remove(event.keyCode)
+                press?.task?.let(handler::removeCallbacks)
+                // Handles a delayed ACTION_UP delivered after the threshold callback.
+                if (press != null && !press.fired && event.eventTime - press.startedAt >= HOLD_THRESHOLD_MS) {
+                    press.fired = true
+                    launchShortcut(digit)
+                }
+            }
+            KeyEvent.ACTION_MULTIPLE -> Unit
         }
-        // Critical: false lets the original key event reach the TV/app.
+        // Preserve ordinary remote operation: never consume the original key event.
         return false
-    }
-
-    private fun thisRunnable(keyCode: Int, press: Press, digit: String): Runnable = Runnable {
-        if (presses[keyCode] === press && !press.fired) {
-            val heldFor = SystemClock.uptimeMillis() - press.startedAt
-            if (heldFor >= HOLD_THRESHOLD_MS) {
-                press.fired = true
-                launchShortcut(digit)
-            } else {
-                press.task = thisRunnable(keyCode, press, digit)
-                handler.postDelayed(press.task!!, HOLD_THRESHOLD_MS - heldFor)
-            }
-        }
     }
 
     private fun digitFor(keyCode: Int): String? = when (keyCode) {
@@ -101,8 +85,9 @@ class RemoteShortcutService : AccessibilityService() {
     override fun onInterrupt() = Unit
 
     override fun onDestroy() {
-        presses.values.forEach { it.task?.let(handler::removeCallbacks) }
+        presses.values.forEach { press -> press.task?.let(handler::removeCallbacks) }
         presses.clear()
+        handler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
 
